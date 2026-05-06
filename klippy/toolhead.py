@@ -48,6 +48,8 @@ class Move:
         else:
             inv_move_d = 1.0 / move_d
         self.axes_r = [d * inv_move_d for d in axes_d]
+        self.start_tangent = tuple(self.axes_r[:3])
+        self.end_tangent = self.start_tangent
         self.min_move_t = move_d / velocity
         # Junction speeds are tracked in velocity squared.  The
         # delta_v2 is the maximum amount of this squared-velocity that
@@ -89,8 +91,8 @@ class Move:
             prev_move.max_start_v2 + prev_move.delta_v2,
         )
         # Find max velocity using "approximated centripetal velocity"
-        axes_r = self.axes_r
-        prev_axes_r = prev_move.axes_r
+        axes_r = self.start_tangent
+        prev_axes_r = prev_move.end_tangent
         junction_cos_theta = -(
             axes_r[0] * prev_axes_r[0]
             + axes_r[1] * prev_axes_r[1]
@@ -136,6 +138,74 @@ class Move:
         self.accel_t = accel_d / ((start_v + cruise_v) * 0.5)
         self.cruise_t = cruise_d / cruise_v
         self.decel_t = decel_d / ((end_v + cruise_v) * 0.5)
+
+
+class ArcMove:
+    def __init__(self, toolhead, arc, speed):
+        self.toolhead = toolhead
+        self.arc = arc
+        self.start_pos = tuple(arc.start_pos)
+        self.end_pos = tuple(arc.end_pos)
+        self.accel = toolhead.max_accel
+        self.junction_deviation = toolhead.junction_deviation
+        self.timing_callbacks = []
+        velocity = min(speed, toolhead.max_velocity)
+        if arc.curvature > 0.0:
+            velocity = min(velocity, math.sqrt(self.accel / arc.curvature))
+        self.is_kinematic_move = True
+        self.axes_d = axes_d = [
+            self.end_pos[i] - self.start_pos[i] for i in (0, 1, 2, 3)
+        ]
+        self.move_d = move_d = arc.path_length
+        self.axes_r = [
+            arc.start_tangent[0],
+            arc.start_tangent[1],
+            arc.start_tangent[2],
+            arc.e_ratio,
+        ]
+        self.start_tangent = tuple(arc.start_tangent[:3])
+        self.end_tangent = tuple(arc.end_tangent[:3])
+        self.curvature = arc.curvature
+        self.has_xy_motion = arc.path_length > 0.0
+        self.min_move_t = move_d / velocity
+        self.max_start_v2 = 0.0
+        self.max_cruise_v2 = velocity**2
+        self.delta_v2 = 2.0 * move_d * self.accel
+        self.max_smoothed_v2 = 0.0
+        self.smooth_delta_v2 = 2.0 * move_d * toolhead.max_accel_to_decel
+        self.next_junction_v2 = 999999999.9
+
+    def limit_speed(self, speed, accel):
+        speed2 = speed**2
+        if speed2 < self.max_cruise_v2:
+            self.max_cruise_v2 = speed2
+            self.min_move_t = self.move_d / speed
+        self.accel = min(self.accel, accel)
+        self.delta_v2 = 2.0 * self.move_d * self.accel
+        self.smooth_delta_v2 = min(self.smooth_delta_v2, self.delta_v2)
+
+    def limit_next_junction_speed(self, speed):
+        self.next_junction_v2 = min(self.next_junction_v2, speed**2)
+
+    def move_error(self, msg="Move out of range"):
+        ep = self.end_pos
+        m = "%s: %.3f %.3f %.3f [%.3f]" % (msg, ep[0], ep[1], ep[2], ep[3])
+        return self.toolhead.printer.command_error(m)
+
+    def position_at(self, distance):
+        return self.arc.position_at(distance)
+
+    def tangent_at(self, distance):
+        return self.arc.tangent_at(distance)
+
+    def normal_at(self, distance):
+        return self.arc.normal_at(distance)
+
+    def calc_junction(self, prev_move):
+        return Move.calc_junction(self, prev_move)
+
+    def set_junction(self, start_v2, cruise_v2, end_v2):
+        return Move.set_junction(self, start_v2, cruise_v2, end_v2)
 
 
 LOOKAHEAD_FLUSH_TIME = 0.250
@@ -320,6 +390,7 @@ class ToolHead:
         ffi_main, ffi_lib = chelper.get_ffi()
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
+        self.trapq_append_arc = ffi_lib.trapq_append_arc
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
         self.step_generators = []
         # Create kinematics class
@@ -462,22 +533,45 @@ class ToolHead:
         next_move_time = self.print_time
         for move in moves:
             if move.is_kinematic_move:
-                self.trapq_append(
-                    self.trapq,
-                    next_move_time,
-                    move.accel_t,
-                    move.cruise_t,
-                    move.decel_t,
-                    move.start_pos[0],
-                    move.start_pos[1],
-                    move.start_pos[2],
-                    move.axes_r[0],
-                    move.axes_r[1],
-                    move.axes_r[2],
-                    move.start_v,
-                    move.cruise_v,
-                    move.accel,
-                )
+                if isinstance(move, ArcMove):
+                    arc = move.arc
+                    self.trapq_append_arc(
+                        self.trapq,
+                        next_move_time,
+                        move.accel_t,
+                        move.cruise_t,
+                        move.decel_t,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        arc.center[0],
+                        arc.center[1],
+                        arc.radius,
+                        arc.start_angle,
+                        arc.angular_travel,
+                        arc.path_length,
+                        arc.linear_delta,
+                        move.start_v,
+                        move.cruise_v,
+                        move.accel,
+                    )
+                else:
+                    self.trapq_append(
+                        self.trapq,
+                        next_move_time,
+                        move.accel_t,
+                        move.cruise_t,
+                        move.decel_t,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        move.start_v,
+                        move.cruise_v,
+                        move.accel,
+                    )
             if move.axes_d[3]:
                 self.extruder.move(next_move_time, move)
             next_move_time = (
@@ -618,6 +712,18 @@ class ToolHead:
             return
         if move.is_kinematic_move:
             self.kin.check_move(move)
+        if move.axes_d[3]:
+            self.extruder.check_move(move)
+        self.commanded_pos[:] = move.end_pos
+        self.lookahead.add_move(move)
+        if self.print_time > self.need_check_pause:
+            self._check_pause()
+
+    def move_arc(self, arc, speed):
+        move = ArcMove(self, arc, speed)
+        if not move.move_d:
+            return
+        self.kin.check_move(move)
         if move.axes_d[3]:
             self.extruder.check_move(move)
         self.commanded_pos[:] = move.end_pos

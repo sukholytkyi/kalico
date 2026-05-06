@@ -8,6 +8,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math
 
+from .arc_geometry import ArcGeometryError
+
 # Coordinates created by this are converted into G1 commands.
 #
 # supports XY, XZ & YZ planes with remaining axis as helical
@@ -28,6 +30,7 @@ class ArcSupport:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.mm_per_arc_segment = config.getfloat("resolution", 1.0, above=0.0)
+        self.native = config.getboolean("native", False)
 
         self.gcode_move = self.printer.load_object(config, "gcode_move")
         self.gcode = self.printer.lookup_object("gcode")
@@ -90,6 +93,11 @@ class ArcSupport:
         if not (asPlanar[0] or asPlanar[1]):
             raise gcmd.error("G2/G3 requires IJ, IK or JK parameters")
 
+        if self._try_native_arc(
+            currentPos, asTarget, asPlanar, clockwise, gcmd, axes
+        ):
+            return
+
         # Build linear coordinates to move
         self.planArc(
             currentPos,
@@ -100,6 +108,21 @@ class ArcSupport:
             absolut_extrude,
             *axes,
         )
+
+    def _try_native_arc(self, currentPos, targetPos, offset, clockwise, gcmd, axes):
+        if not self.native:
+            return False
+        if axes != (X_AXIS, Y_AXIS, Z_AXIS):
+            return False
+        if targetPos[Z_AXIS] != currentPos[Z_AXIS]:
+            return False
+        if not self.gcode_move.can_use_native_arc_moves():
+            return False
+        try:
+            self.gcode_move.cmd_G2G3(gcmd, targetPos, offset, clockwise, axes)
+        except ArcGeometryError:
+            return False
+        return True
 
     # function planArc() originates from marlin plan_arc()
     # https://github.com/MarlinFirmware/Marlin

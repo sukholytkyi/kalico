@@ -11,6 +11,12 @@
 #include "compiler.h" // unlikely
 #include "trapq.h" // move_get_coord
 
+#define MOVE_TYPE_LINE 0
+#define MOVE_TYPE_ARC 1
+#define AXIS_ACTIVE_X (1 << 0)
+#define AXIS_ACTIVE_Y (1 << 1)
+#define AXIS_ACTIVE_Z (1 << 2)
+
 // Allocate a new 'move' object
 struct move *
 move_alloc(void)
@@ -32,10 +38,25 @@ inline struct coord
 move_get_coord(struct move *m, double move_time)
 {
     double move_dist = move_get_distance(m, move_time);
+    if (m->move_type == MOVE_TYPE_ARC) {
+        double theta = m->arc_start_angle + m->arc_angular_r * move_dist;
+        return (struct coord) {
+            .x = m->arc_center_x + m->arc_radius * cos(theta),
+            .y = m->arc_center_y + m->arc_radius * sin(theta),
+            .z = m->start_pos.z + m->axes_r.z * move_dist };
+    }
     return (struct coord) {
         .x = m->start_pos.x + m->axes_r.x * move_dist,
         .y = m->start_pos.y + m->axes_r.y * move_dist,
         .z = m->start_pos.z + m->axes_r.z * move_dist };
+}
+
+static int
+axes_active_from_axes_r(struct coord axes_r)
+{
+    return ((axes_r.x != 0.) ? AXIS_ACTIVE_X : 0)
+        | ((axes_r.y != 0.) ? AXIS_ACTIVE_Y : 0)
+        | ((axes_r.z != 0.) ? AXIS_ACTIVE_Z : 0);
 }
 
 #define NEVER_TIME 9999999999999999.9
@@ -133,6 +154,7 @@ trapq_append(struct trapq *tq, double print_time
         m->half_accel = .5 * accel;
         m->start_pos = start_pos;
         m->axes_r = axes_r;
+        m->axes_active = axes_active_from_axes_r(axes_r);
         trapq_add_move(tq, m);
 
         print_time += accel_t;
@@ -146,6 +168,7 @@ trapq_append(struct trapq *tq, double print_time
         m->half_accel = 0.;
         m->start_pos = start_pos;
         m->axes_r = axes_r;
+        m->axes_active = axes_active_from_axes_r(axes_r);
         trapq_add_move(tq, m);
 
         print_time += cruise_t;
@@ -159,7 +182,84 @@ trapq_append(struct trapq *tq, double print_time
         m->half_accel = -.5 * accel;
         m->start_pos = start_pos;
         m->axes_r = axes_r;
+        m->axes_active = axes_active_from_axes_r(axes_r);
         trapq_add_move(tq, m);
+    }
+}
+
+static struct coord
+arc_get_coord(double center_x, double center_y, double radius
+              , double start_angle, double angular_r, double start_z
+              , double z_r, double move_dist)
+{
+    double theta = start_angle + angular_r * move_dist;
+    return (struct coord) {
+        .x = center_x + radius * cos(theta),
+        .y = center_y + radius * sin(theta),
+        .z = start_z + z_r * move_dist };
+}
+
+static void
+trapq_add_arc_move(struct trapq *tq, double print_time, double move_t
+                   , double start_v, double half_accel
+                   , double center_x, double center_y, double radius
+                   , double start_angle, double angular_r
+                   , double start_z, double z_r, double arc_start_d)
+{
+    struct move *m = move_alloc();
+    m->print_time = print_time;
+    m->move_t = move_t;
+    m->start_v = start_v;
+    m->half_accel = half_accel;
+    m->move_type = MOVE_TYPE_ARC;
+    m->arc_center_x = center_x;
+    m->arc_center_y = center_y;
+    m->arc_radius = radius;
+    m->arc_start_angle = start_angle + angular_r * arc_start_d;
+    m->arc_angular_r = angular_r;
+    m->axes_r.z = z_r;
+    m->start_pos = arc_get_coord(center_x, center_y, radius, start_angle
+                                 , angular_r, start_z, z_r, arc_start_d);
+    // Store the phase start tangent for activity checks and history output.
+    double direction = angular_r < 0. ? -1. : 1.;
+    m->axes_r.x = -sin(m->arc_start_angle) * direction;
+    m->axes_r.y = cos(m->arc_start_angle) * direction;
+    m->axes_active = AXIS_ACTIVE_X | AXIS_ACTIVE_Y
+        | ((z_r != 0.) ? AXIS_ACTIVE_Z : 0);
+    trapq_add_move(tq, m);
+}
+
+// Fill and add a native XY arc move to the trapezoid velocity queue
+void __visible
+trapq_append_arc(struct trapq *tq, double print_time
+                 , double accel_t, double cruise_t, double decel_t
+                 , double start_pos_x, double start_pos_y, double start_pos_z
+                 , double center_x, double center_y, double radius
+                 , double start_angle, double angular_travel
+                 , double path_length, double linear_z_delta
+                 , double start_v, double cruise_v, double accel)
+{
+    double angular_r = angular_travel / path_length;
+    double z_r = linear_z_delta / path_length;
+    double arc_start_d = 0.;
+    if (accel_t) {
+        trapq_add_arc_move(tq, print_time, accel_t, start_v, .5 * accel
+                           , center_x, center_y, radius, start_angle
+                           , angular_r, start_pos_z, z_r, arc_start_d);
+        arc_start_d += (start_v + .5 * accel * accel_t) * accel_t;
+        print_time += accel_t;
+    }
+    if (cruise_t) {
+        trapq_add_arc_move(tq, print_time, cruise_t, cruise_v, 0.
+                           , center_x, center_y, radius, start_angle
+                           , angular_r, start_pos_z, z_r, arc_start_d);
+        arc_start_d += cruise_v * cruise_t;
+        print_time += cruise_t;
+    }
+    if (decel_t) {
+        trapq_add_arc_move(tq, print_time, decel_t, cruise_v, -.5 * accel
+                           , center_x, center_y, radius, start_angle
+                           , angular_r, start_pos_z, z_r, arc_start_d);
     }
 }
 

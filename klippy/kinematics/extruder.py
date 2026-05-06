@@ -287,6 +287,11 @@ class PrinterExtruder:
     def stats(self, eventtime):
         return self.heater.stats(eventtime)
 
+    def _move_has_xy_motion(self, move):
+        return bool(
+            move.axes_d[0] or move.axes_d[1] or getattr(move, "has_xy_motion", False)
+        )
+
     def check_move(self, move):
         axis_r = move.axes_r[3]
         if not self.heater.can_extrude:
@@ -294,7 +299,7 @@ class PrinterExtruder:
                 "Extrude below minimum temp\n"
                 "See the 'min_extrude_temp' config option for details"
             )
-        if (not move.axes_d[0] and not move.axes_d[1]) or axis_r < 0.0:
+        if not self._move_has_xy_motion(move) or axis_r < 0.0:
             # Extrude only move (or retraction move) - limit accel and velocity
             if abs(move.axes_d[3]) > self.max_e_dist:
                 raise self.printer.command_error(
@@ -341,7 +346,7 @@ class PrinterExtruder:
         if self.extruder_stepper:
             if self.extruder_stepper.per_move_pressure_advance:
                 use_pa_from_trapq = 1.0
-            if axis_r > 0.0 and (move.axes_d[0] or move.axes_d[1]):
+            if axis_r > 0.0 and self._move_has_xy_motion(move):
                 pressure_advance = self.extruder_stepper.pressure_advance
         # Queue movement (x is extruder movement, y is pressure advance flag)
         self.trapq_append(

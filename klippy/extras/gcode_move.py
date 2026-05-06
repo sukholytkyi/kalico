@@ -5,6 +5,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 
+from .arc_geometry import ArcGeometry
+
 
 class GCodeMove:
     def __init__(self, config):
@@ -68,14 +70,15 @@ class GCodeMove:
         # G-Code state
         self.saved_states = {}
         self.move_transform = self.move_with_transform = None
+        self.toolhead = None
         self.position_with_transform = lambda: [0.0, 0.0, 0.0, 0.0]
 
     def _handle_ready(self):
         self.is_printer_ready = True
+        self.toolhead = self.printer.lookup_object("toolhead")
         if self.move_transform is None:
-            toolhead = self.printer.lookup_object("toolhead")
-            self.move_with_transform = toolhead.move
-            self.position_with_transform = toolhead.get_position
+            self.move_with_transform = self.toolhead.move
+            self.position_with_transform = self.toolhead.get_position
         self.reset_last_position()
 
     def _handle_shutdown(self):
@@ -118,6 +121,12 @@ class GCodeMove:
         self.move_with_transform = transform.move
         self.position_with_transform = transform.get_position
         return old_transform
+
+    def has_move_transform(self):
+        return self.move_transform not in (None, self.toolhead)
+
+    def can_use_native_arc_moves(self):
+        return not self.has_move_transform()
 
     def _get_gcode_position(self):
         p = [lp - bp for lp, bp in zip(self.last_position, self.base_position)]
@@ -181,6 +190,34 @@ class GCodeMove:
                 "Unable to parse move '%s'" % (gcmd.get_commandline(),)
             )
         self.move_with_transform(self.last_position, self.speed)
+
+    def cmd_G2G3(self, gcmd, target_pos, offset, clockwise, axes):
+        params = gcmd.get_command_parameters()
+        start_pos = list(self.last_position)
+        new_position = list(self.last_position)
+        try:
+            for pos in range(3):
+                new_position[pos] = target_pos[pos] + self.base_position[pos]
+            if "E" in params:
+                v = float(params["E"]) * self.extrude_factor
+                if not self.absolute_coord or not self.absolute_extrude:
+                    new_position[3] += v
+                else:
+                    new_position[3] = v + self.base_position[3]
+            if "F" in params:
+                gcode_speed = float(params["F"])
+                if gcode_speed <= 0.0:
+                    raise gcmd.error(
+                        "Invalid speed in '%s'" % (gcmd.get_commandline(),)
+                    )
+                self.speed = gcode_speed * self.speed_factor
+        except ValueError as e:
+            raise gcmd.error(
+                "Unable to parse move '%s'" % (gcmd.get_commandline(),)
+            )
+        arc = ArcGeometry(start_pos, new_position, offset, clockwise, *axes)
+        self.last_position = new_position
+        self.toolhead.move_arc(arc, self.speed)
 
     # G-Code coordinate manipulation
     def cmd_G20(self, gcmd):
